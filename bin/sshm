@@ -1,0 +1,965 @@
+#!/usr/bin/env python3
+"""
+SSH Manager (sshm)
+A modern, fast, and elegant SSH connection manager for Linux & macOS.
+Features:
+- Save and edit servers with friendly aliases
+- List with live TCP latency ping & connection stats
+- Interactive TUI picker (arrows, fuzzy search, direct number)
+- Auto-sync with OpenSSH (~/.ssh/sshm_config included in ~/.ssh/config)
+- Transparent shell wrapper preserving native ssh behavior
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import curses
+import datetime
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import Confirm, Prompt
+    from rich.table import Table
+    from rich import box
+except ImportError:
+    print("Erreur: Le module 'rich' est requis. Installez-le avec : pip install rich", file=sys.stderr)
+    sys.exit(1)
+
+# Chemins de configuration
+CONFIG_DIR = Path.home() / ".config" / "sshm"
+DATA_FILE = CONFIG_DIR / "servers.json"
+SSH_DIR = Path.home() / ".ssh"
+SSHM_CONFIG = SSH_DIR / "sshm_config"
+OPENSSH_CONFIG = SSH_DIR / "config"
+
+console = Console()
+err_console = Console(stderr=True)
+
+
+def ensure_paths() -> None:
+    """Crée les répertoires nécessaires avec les bonnes permissions."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SSH_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(SSH_DIR, 0o700)
+    except Exception:
+        pass
+
+
+def load_data() -> Dict[str, Any]:
+    """Charge les données des serveurs depuis le fichier JSON."""
+    ensure_paths()
+    if not DATA_FILE.exists():
+        initial_data = {
+            "version": 1,
+            "servers": {}
+        }
+        save_data(initial_data)
+        return initial_data
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        err_console.print(f"[bold red]Erreur lors de la lecture de {DATA_FILE}:[/] {e}")
+        return {"version": 1, "servers": {}}
+
+
+def save_data(data: Dict[str, Any]) -> None:
+    """Enregistre les données des serveurs et synchronise OpenSSH."""
+    ensure_paths()
+    tmp_file = DATA_FILE.with_suffix(".tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp_file.replace(DATA_FILE)
+    sync_openssh(data.get("servers", {}))
+
+
+def find_ssh_keys() -> List[Path]:
+    """Recherche toutes les clés privées disponibles dans ~/.ssh."""
+    keys: List[Path] = []
+    if not SSH_DIR.exists():
+        return keys
+    for pub in SSH_DIR.glob("*.pub"):
+        priv = pub.with_suffix("")
+        if priv.exists() and priv.is_file():
+            keys.append(priv)
+    return sorted(keys)
+
+
+def sync_openssh(servers: Dict[str, Any]) -> None:
+    """Synchronise la liste des serveurs avec ~/.ssh/sshm_config et ~/.ssh/config."""
+    ensure_paths()
+    lines = [
+        "# =====================================================================",
+        "# Ce fichier est généré automatiquement par SSH Manager (sshm).",
+        "# Les modifications manuelles seront écrasées.",
+        "# =====================================================================",
+        ""
+    ]
+
+    for name, s in sorted(servers.items()):
+        lines.append(f"Host {name}")
+        lines.append(f"    HostName {s['host']}")
+        if s.get("user"):
+            lines.append(f"    User {s['user']}")
+        if s.get("port") and int(s["port"]) != 22:
+            lines.append(f"    Port {s['port']}")
+        if s.get("identity_file"):
+            lines.append(f"    IdentityFile {s['identity_file']}")
+            lines.append("    IdentitiesOnly yes")
+        lines.append("")
+
+    content = "\n".join(lines)
+    with open(SSHM_CONFIG, "w", encoding="utf-8") as f:
+        f.write(content)
+    try:
+        os.chmod(SSHM_CONFIG, 0o600)
+    except Exception:
+        pass
+
+    # Directive Include universelle dans ~/.ssh/config
+    include_directive = f"Include {SSHM_CONFIG}"
+    include_alt = "Include ~/.ssh/sshm_config"
+    if OPENSSH_CONFIG.exists():
+        config_text = OPENSSH_CONFIG.read_text(encoding="utf-8", errors="ignore")
+        if include_directive not in config_text and include_alt not in config_text:
+            new_text = f"# Include SSH Manager\n{include_directive}\n\n" + config_text
+            OPENSSH_CONFIG.write_text(new_text, encoding="utf-8")
+            try:
+                os.chmod(OPENSSH_CONFIG, 0o600)
+            except Exception:
+                pass
+    else:
+        new_text = f"# Configuration OpenSSH Client\n# Géré par SSH Manager\n{include_directive}\n\n"
+        OPENSSH_CONFIG.write_text(new_text, encoding="utf-8")
+        try:
+            os.chmod(OPENSSH_CONFIG, 0o600)
+        except Exception:
+            pass
+
+
+def check_latency(host: str, port: int, timeout: float = 1.2) -> Tuple[bool, float, str]:
+    """Mesure la latence TCP et extrait la bannière SSH."""
+    t0 = time.time()
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as s:
+            latency = (time.time() - t0) * 1000
+            s.settimeout(0.6)
+            try:
+                banner = s.recv(512).decode(errors="ignore").strip()
+            except Exception:
+                banner = ""
+            return True, latency, banner
+    except Exception:
+        return False, -1.0, ""
+
+
+def probe_key_auth(server: Dict[str, Any], key_path: Optional[str] = None, timeout: int = 2) -> bool:
+    """Vérifie si une clé SSH permet de s'authentifier sans mot de passe."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}", "-p", str(server.get("port", 22))]
+    if key_path:
+        cmd.extend(["-i", os.path.expanduser(key_path)])
+    target = f"{server['user']}@{server['host']}" if server.get("user") else server["host"]
+    cmd.extend([target, "true"])
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout + 1)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def format_relative_time(iso_str: Optional[str]) -> str:
+    """Convertit un timestamp ISO en libellé relatif lisible."""
+    if not iso_str:
+        return "[dim]Jamais[/dim]"
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str)
+        now = datetime.datetime.now()
+        diff = now - dt
+        seconds = int(diff.total_seconds())
+        if seconds < 60:
+            return "À l'instant"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"Il y a {minutes} min"
+        hours = minutes // 60
+        if hours < 24:
+            return f"Il y a {hours} h"
+        days = hours // 24
+        if days == 1:
+            return "Hier"
+        if days < 7:
+            return f"Il y a {days} j"
+        return dt.strftime("%d/%m/%Y")
+    except Exception:
+        return "[dim]Inconnu[/dim]"
+
+
+# =============================================================================
+# COMMANDE : SET / ADD
+# =============================================================================
+
+def cmd_set(args: argparse.Namespace) -> None:
+    data = load_data()
+    servers = data.setdefault("servers", {})
+
+    name = args.name
+    raw_target = args.target
+    user = args.user
+    host = args.host
+    port = args.port
+    identity_file = args.key
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
+    desc = args.desc or ""
+
+    # Parse shorthand: user@host:port or host:port
+    if raw_target:
+        m = re.match(r"^(?:([^@]+)@)?([^:]+)(?::(\d+))?$", raw_target)
+        if m:
+            t_user, t_host, t_port = m.groups()
+            if t_user and not user:
+                user = t_user
+            if t_host and not host:
+                host = t_host
+            if t_port and not port:
+                port = int(t_port)
+
+    # Si arguments incomplets ou mode interactif demandé
+    is_interactive = args.interactive or not (name and host)
+
+    if is_interactive:
+        console.print(Panel.fit("[bold cyan]Configuration d'une nouvelle connexion SSH[/bold cyan]", border_style="cyan"))
+
+        if not name:
+            default_name = host.split(".")[0] if host else "serveur"
+            name = Prompt.ask("[bold green]Nom / Alias du serveur[/bold green]", default=default_name).strip()
+
+        # Si le serveur existe déjà
+        if name in servers and not args.force:
+            existing = servers[name]
+            console.print(f"[yellow]Le serveur [bold]{name}[/bold] existe déjà ({existing.get('user')}@{existing.get('host')}).[/yellow]")
+            if not Confirm.ask("Voulez-vous modifier ce serveur ?", default=True):
+                console.print("[dim]Annulé.[/dim]")
+                return
+            host = host or existing.get("host")
+            user = user or existing.get("user")
+            port = port or existing.get("port", 22)
+            identity_file = identity_file or existing.get("identity_file")
+            tags = tags or existing.get("tags", [])
+            desc = desc or existing.get("description", "")
+
+        host = Prompt.ask("[bold green]Adresse IP ou nom de domaine (Host)[/bold green]", default=host or "").strip()
+        while not host:
+            host = Prompt.ask("[bold red]L'adresse est requise :[/bold red]").strip()
+
+        current_user = os.getenv("USER", "root")
+        user = Prompt.ask("[bold green]Utilisateur SSH[/bold green]", default=user or current_user).strip()
+
+        port_str = Prompt.ask("[bold green]Port SSH[/bold green]", default=str(port or 22)).strip()
+        try:
+            port = int(port_str)
+        except ValueError:
+            port = 22
+
+        # Détection des clés SSH
+        available_keys = find_ssh_keys()
+        if not identity_file:
+            if available_keys:
+                console.print("\n[bold cyan]Clés SSH détectées sur votre machine :[/bold cyan]")
+                for i, k in enumerate(available_keys, 1):
+                    console.print(f"  [bold cyan][{i}][/] {k.name} [dim]({k})[/dim]")
+                console.print("  [bold cyan][0][/] Laisser par défaut (OpenSSH standard)")
+                console.print("  [bold cyan][m][/] Spécifier un chemin manuellement")
+
+                choice = Prompt.ask("Choisissez une clé", choices=[str(i) for i in range(len(available_keys) + 1)] + ["m"], default="1")
+                if choice == "0":
+                    identity_file = None
+                elif choice == "m":
+                    manual_path = Prompt.ask("Chemin vers la clé privée").strip()
+                    identity_file = str(Path(manual_path).expanduser()) if manual_path else None
+                else:
+                    identity_file = str(available_keys[int(choice) - 1])
+            else:
+                manual_path = Prompt.ask("[bold green]Clé SSH privée (laisser vide pour défaut)[/bold green]", default="").strip()
+                identity_file = str(Path(manual_path).expanduser()) if manual_path else None
+
+        tags_str = Prompt.ask("[bold green]Tags (séparés par des virgules)[/bold green]", default=",".join(tags)).strip()
+        tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+        desc = Prompt.ask("[bold green]Description / Note[/bold green]", default=desc).strip()
+    else:
+        # Non-interactif
+        if not user:
+            user = os.getenv("USER", "root")
+        if not port:
+            port = 22
+
+        # Auto-détection intelligente de la clé si non fournie et si hôte joignable
+        if not identity_file:
+            is_up, _, _ = check_latency(host, port, timeout=0.5)
+            if is_up:
+                temp_server = {"host": host, "user": user, "port": port}
+                for k in find_ssh_keys():
+                    if probe_key_auth(temp_server, str(k), timeout=1):
+                        identity_file = str(k)
+                        console.print(f"[green]✔ Clé détectée automatiquement :[/] [bold]{k.name}[/]")
+                        break
+
+    now = datetime.datetime.now().isoformat()
+    is_new = name not in servers
+
+    server_entry = {
+        "name": name,
+        "host": host,
+        "user": user,
+        "port": int(port),
+        "identity_file": identity_file,
+        "tags": tags,
+        "description": desc,
+        "updated_at": now,
+        "last_connected_at": servers.get(name, {}).get("last_connected_at"),
+        "connect_count": servers.get(name, {}).get("connect_count", 0)
+    }
+    if is_new:
+        server_entry["created_at"] = now
+
+    servers[name] = server_entry
+    save_data(data)
+
+    action_label = "ajouté" if is_new else "mis à jour"
+    console.print(f"\n[bold green]✔ Serveur '{name}' {action_label} avec succès ![/bold green]")
+    console.print(f"  [dim]• Connexion :[/dim] [cyan]{user}@{host}:{port}[/cyan]")
+    if identity_file:
+        console.print(f"  [dim]• Clé :[/dim] [yellow]{identity_file}[/yellow]")
+    console.print(f"  [dim]• Raccourci natif :[/dim] [bold white]ssh {name}[/bold white]")
+
+    # Option de test immédiat en mode interactif
+    if is_interactive and Confirm.ask("\nVoulez-vous tester la connexion maintenant ?", default=True):
+        test_single_server(server_entry)
+
+
+# =============================================================================
+# COMMANDE : LIST / LS
+# =============================================================================
+
+def cmd_list(args: argparse.Namespace) -> None:
+    data = load_data()
+    servers = data.get("servers", {})
+
+    if not servers:
+        console.print(Panel(
+            "[bold yellow]Aucun serveur configuré pour le moment.[/bold yellow]\n\n"
+            "Ajoutez votre premier serveur avec :\n"
+            "  [bold green]ssh set <nom> <user@ip>[/bold green]\n"
+            "  Exemple : [cyan]ssh set prod root@203.0.113.10[/cyan]",
+            title="SSH Manager",
+            border_style="yellow"
+        ))
+        return
+
+    # Filtrage par tag si demandé
+    if getattr(args, "tag", None):
+        servers = {k: v for k, v in servers.items() if args.tag.lower() in [t.lower() for t in v.get("tags", [])]}
+        if not servers:
+            console.print(f"[yellow]Aucun serveur avec le tag '{args.tag}'.[/yellow]")
+            return
+
+    # Mode simple pour scripts / complétion
+    if getattr(args, "quiet", False):
+        for name in sorted(servers.keys()):
+            print(name)
+        return
+
+    if getattr(args, "json_output", False):
+        print(json.dumps(servers, indent=2, ensure_ascii=False))
+        return
+
+    sorted_servers = sorted(servers.values(), key=lambda s: s["name"])
+
+    # Ping parallèle si actif
+    ping_results: Dict[str, Tuple[bool, float, str]] = {}
+    if not getattr(args, "no_ping", False):
+        with console.status("[bold cyan]Test de la latence des serveurs en cours...[/bold cyan]", spinner="dots"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {
+                    executor.submit(check_latency, s["host"], s.get("port", 22)): s["name"]
+                    for s in sorted_servers
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    s_name = futures[fut]
+                    try:
+                        ping_results[s_name] = fut.result()
+                    except Exception:
+                        ping_results[s_name] = (False, -1.0, "")
+
+    term_w = console.width
+
+    table = Table(
+        title="[bold cyan]🚀 Serveurs SSH Enregistrés[/bold cyan]",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+        title_justify="left"
+    )
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Alias", style="bold cyan", no_wrap=True)
+    table.add_column("Cible (User@Host)", style="bright_white", no_wrap=True)
+    table.add_column("Clé SSH", style="yellow", no_wrap=True, min_width=11)
+    table.add_column("Statut", justify="center", no_wrap=True)
+    table.add_column("Dernière Connexion", style="dim", no_wrap=True, min_width=18)
+    if term_w >= 105:
+        table.add_column("Tags", style="cyan")
+        table.add_column("Description", style="italic dim")
+    elif term_w >= 85:
+        table.add_column("Tags / Note", style="dim")
+
+    for i, s in enumerate(sorted_servers, 1):
+        name = s["name"]
+        user_host = f"{s.get('user', 'root')}@{s['host']}"
+        port = s.get("port", 22)
+        if port != 22:
+            user_host += f":{port}"
+
+        # Clé
+        key_raw = s.get("identity_file")
+        if key_raw:
+            key_name = Path(key_raw).name
+        else:
+            key_name = "[dim]défaut[/dim]"
+
+        # Statut Ping
+        if name in ping_results:
+            ok, lat, _ = ping_results[name]
+            if ok:
+                if lat < 60:
+                    status_text = f"[bold green]🟢 {lat:.0f} ms[/bold green]"
+                elif lat < 160:
+                    status_text = f"[bold yellow]🟡 {lat:.0f} ms[/bold yellow]"
+                else:
+                    status_text = f"[bold red]🟠 {lat:.0f} ms[/bold red]"
+            else:
+                status_text = "[bold red]🔴 Injoignable[/bold red]"
+        else:
+            status_text = "[dim]Non testé[/dim]"
+
+        # Dernière connexion
+        last_conn = format_relative_time(s.get("last_connected_at"))
+
+        # Tags et description
+        tags_list = s.get("tags", [])
+        tags_str = " ".join([f"[cyan]#{t}[/cyan]" for t in tags_list]) if tags_list else ""
+        desc = s.get("description", "")
+
+        row = [
+            str(i),
+            name,
+            user_host,
+            key_name,
+            status_text,
+            last_conn
+        ]
+        if term_w >= 105:
+            row.extend([tags_str, desc])
+        elif term_w >= 85:
+            combined = f"{tags_str} ({desc})" if desc and tags_str else (tags_str or desc)
+            row.append(combined)
+
+        table.add_row(*row)
+
+    console.print()
+    console.print(table)
+    console.print()
+    console.print(
+        "[dim]Astuce: Connectez-vous avec [/dim][bold cyan]ssh connect <nom>[/bold cyan]"
+        "[dim] ou directement [/dim][bold white]ssh <nom>[/bold white]"
+        "[dim]. Tapez [/dim][bold cyan]ssh connect[/bold cyan][dim] pour le menu interactif.[/dim]"
+    )
+
+
+# =============================================================================
+# COMMANDE : CONNECT
+# =============================================================================
+
+def cmd_connect(args: argparse.Namespace) -> None:
+    data = load_data()
+    servers = data.get("servers", {})
+
+    target_name = args.target
+    extra_args = args.extra_args or []
+
+    # Si un nom ou index est donné directement
+    if target_name:
+        server = resolve_server(servers, target_name)
+        if not server:
+            console.print(f"[bold red]Serveur '{target_name}' introuvable.[/bold red]")
+            candidates = [s for s in servers.keys() if target_name.lower() in s.lower()]
+            if candidates:
+                console.print(f"[dim]Vouliez-vous dire :[/dim] {', '.join(candidates)} ?")
+            sys.exit(1)
+        execute_connection(server, extra_args)
+        return
+
+    # Mode interactif : sélection par menu
+    if not servers:
+        console.print("[yellow]Aucun serveur enregistré. Utilisez [bold]ssh set <nom> <user@ip>[/bold] pour en ajouter un.[/yellow]")
+        sys.exit(1)
+
+    selected_server = interactive_picker(servers)
+    if selected_server:
+        execute_connection(selected_server, extra_args)
+    else:
+        console.print("[dim]Connexion annulée.[/dim]")
+
+
+def resolve_server(servers: Dict[str, Any], query: str) -> Optional[Dict[str, Any]]:
+    """Résout un serveur par nom exact, ou par son numéro d'index (1-based)."""
+    if query in servers:
+        return servers[query]
+    if query.isdigit():
+        idx = int(query) - 1
+        sorted_keys = sorted(servers.keys())
+        if 0 <= idx < len(sorted_keys):
+            return servers[sorted_keys[idx]]
+    for k, v in servers.items():
+        if k.lower() == query.lower():
+            return v
+    return None
+
+
+def execute_connection(server: Dict[str, Any], extra_args: List[str]) -> None:
+    """Met à jour les statistiques et remplace le processus par SSH."""
+    data = load_data()
+    name = server["name"]
+    if name in data.get("servers", {}):
+        data["servers"][name]["last_connected_at"] = datetime.datetime.now().isoformat()
+        data["servers"][name]["connect_count"] = data["servers"][name].get("connect_count", 0) + 1
+        save_data(data)
+
+    cmd = ["ssh"]
+    if server.get("port") and int(server["port"]) != 22:
+        cmd.extend(["-p", str(server["port"])])
+    if server.get("identity_file"):
+        cmd.extend(["-i", os.path.expanduser(server["identity_file"])])
+    target = f"{server['user']}@{server['host']}" if server.get("user") else server["host"]
+    cmd.append(target)
+    cmd.extend(extra_args)
+
+    console.print(f"[dim]Connexion à[/dim] [bold cyan]{name}[/bold cyan] [dim]({target})...[/dim]\n")
+    try:
+        os.execvp("ssh", cmd)
+    except Exception as e:
+        err_console.print(f"[bold red]Erreur lors du lancement de ssh :[/bold red] {e}")
+        sys.exit(1)
+
+
+# =============================================================================
+# SÉLECTEUR INTERACTIF (CURSES / TUI)
+# =============================================================================
+
+def interactive_picker(servers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Ouvre un menu interactif curses pour choisir le serveur."""
+    if not sys.stdin.isatty():
+        return fallback_picker(servers)
+
+    server_list = sorted(servers.values(), key=lambda s: s["name"])
+
+    def curses_main(stdscr: Any) -> Optional[Dict[str, Any]]:
+        curses.curs_set(0)
+        stdscr.timeout(100)
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
+
+        selected_idx = 0
+        search_query = ""
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            title = " 🚀 SSH MANAGER - Sélecteur de Connexion "
+            stdscr.addstr(1, 2, title, curses.A_BOLD | curses.color_pair(4))
+
+            search_bar = f" Filtrer : [ {search_query} ]"
+            stdscr.addstr(2, 2, search_bar)
+
+            filtered = [
+                s for s in server_list
+                if search_query.lower() in s["name"].lower()
+                or search_query.lower() in s["host"].lower()
+                or search_query.lower() in " ".join(s.get("tags", [])).lower()
+                or search_query.lower() in s.get("description", "").lower()
+            ]
+
+            if selected_idx >= len(filtered):
+                selected_idx = max(0, len(filtered) - 1)
+
+            start_y = 4
+            max_rows = h - start_y - 3
+
+            if not filtered:
+                stdscr.addstr(start_y, 4, "Aucun serveur ne correspond à la recherche.", curses.color_pair(3))
+            else:
+                for idx, s in enumerate(filtered[:max_rows]):
+                    row_y = start_y + idx
+                    is_selected = (idx == selected_idx)
+                    num_str = f"[{idx + 1}]" if idx < 9 else "   "
+                    name_str = f"{s['name']:<16}"
+                    target_str = f"{s.get('user', 'root')}@{s['host']}"
+                    if s.get("port", 22) != 22:
+                        target_str += f":{s['port']}"
+                    target_str = f"{target_str:<28}"
+                    tags_str = " ".join([f"#{t}" for t in s.get("tags", [])])
+
+                    line_text = f" {num_str} {name_str} {target_str} {tags_str}"
+                    line_text = line_text[:w - 4]
+
+                    if is_selected:
+                        stdscr.addstr(row_y, 2, line_text.ljust(w - 4), curses.color_pair(1) | curses.A_BOLD)
+                    else:
+                        stdscr.addstr(row_y, 2, line_text)
+
+            footer = " [↑/↓] Naviguer  [Entrée] Connecter  [1-9] Choix direct  [q] Quitter "
+            stdscr.addstr(h - 2, 2, footer, curses.A_DIM)
+
+            stdscr.refresh()
+
+            try:
+                ch = stdscr.getch()
+            except Exception:
+                ch = -1
+
+            if ch == -1:
+                continue
+
+            if ch in (curses.KEY_UP, ord("k")):
+                if selected_idx > 0:
+                    selected_idx -= 1
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                if selected_idx < len(filtered) - 1:
+                    selected_idx += 1
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                if filtered:
+                    return filtered[selected_idx]
+            elif ch in (27, ord("q"), ord("Q")):
+                if search_query:
+                    search_query = ""
+                else:
+                    return None
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                if search_query:
+                    search_query = search_query[:-1]
+            elif 49 <= ch <= 57:
+                direct_idx = ch - 49
+                if direct_idx < len(filtered):
+                    return filtered[direct_idx]
+            elif 32 <= ch <= 126:
+                search_query += chr(ch)
+
+    try:
+        return curses.wrapper(curses_main)
+    except Exception:
+        return fallback_picker(servers)
+
+
+def fallback_picker(servers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Menu texte classique en cas d'absence de TTY/curses."""
+    server_list = sorted(servers.values(), key=lambda s: s["name"])
+    console.print("\n[bold cyan]Sélectionnez un serveur :[/bold cyan]")
+    for i, s in enumerate(server_list, 1):
+        target = f"{s.get('user', 'root')}@{s['host']}"
+        console.print(f"  [bold cyan][{i}][/] [bold]{s['name']}[/] [dim]({target})[/dim]")
+    choice = Prompt.ask("Entrez le numéro ou le nom (ou 'q' pour quitter)", default="1").strip()
+    if choice.lower() in ("q", "quit", "exit"):
+        return None
+    return resolve_server(servers, choice)
+
+
+# =============================================================================
+# COMMANDE : TEST / PING
+# =============================================================================
+
+def cmd_test(args: argparse.Namespace) -> None:
+    data = load_data()
+    servers = data.get("servers", {})
+
+    target_name = args.target
+    if target_name:
+        server = resolve_server(servers, target_name)
+        if not server:
+            console.print(f"[bold red]Serveur '{target_name}' introuvable.[/bold red]")
+            sys.exit(1)
+        test_single_server(server)
+    else:
+        cmd_list(argparse.Namespace(tag=None, quiet=False, json_output=False, no_ping=False))
+
+
+def test_single_server(server: Dict[str, Any]) -> None:
+    """Effectue un test approfondi (réseau, bannière, authentification clé)."""
+    name = server["name"]
+    host = server["host"]
+    port = server.get("port", 22)
+    user = server.get("user", "root")
+    key = server.get("identity_file")
+
+    console.print(f"\n[bold cyan]Test de la connexion vers '{name}' ({user}@{host}:{port})...[/bold cyan]")
+
+    with console.status("[cyan]Vérification du port TCP...[/cyan]"):
+        ok, latency, banner = check_latency(host, port, timeout=2.0)
+
+    if not ok:
+        console.print(f"  [bold red]✖ Réseau : Inaccessible ou timeout sur le port {port}.[/bold red]")
+        return
+
+    console.print(f"  [bold green]✔ Réseau :[/bold green] Accessible (latence : [bold]{latency:.1f} ms[/bold])")
+    if banner:
+        console.print(f"  [bold green]✔ Bannière SSH :[/bold green] [dim]{banner}[/dim]")
+
+    with console.status("[cyan]Test de l'authentification SSH...[/cyan]"):
+        auth_ok = probe_key_auth(server, key, timeout=3)
+
+    if auth_ok:
+        key_label = Path(key).name if key else "clé par défaut"
+        console.print(f"  [bold green]✔ Authentification :[/bold green] Réussie avec [bold]{key_label}[/bold] !")
+    else:
+        if key:
+            console.print(f"  [yellow]⚠ Authentification :[/yellow] Échec avec la clé spécifiée ({Path(key).name}). Le serveur demande peut-être un mot de passe ou une autre clé.")
+        else:
+            console.print("  [dim]ℹ Authentification : Aucune clé automatique n'a validé sans mot de passe.[/dim]")
+
+
+# =============================================================================
+# COMMANDE : RM / DELETE
+# =============================================================================
+
+def cmd_rm(args: argparse.Namespace) -> None:
+    data = load_data()
+    servers = data.get("servers", {})
+
+    target_name = args.name
+    server = resolve_server(servers, target_name)
+    if not server:
+        console.print(f"[bold red]Serveur '{target_name}' introuvable.[/bold red]")
+        sys.exit(1)
+
+    real_name = server["name"]
+    if not args.force:
+        if not Confirm.ask(f"Êtes-vous sûr de vouloir supprimer le serveur [bold red]{real_name}[/bold red] ?", default=False):
+            console.print("[dim]Suppression annulée.[/dim]")
+            return
+
+    del servers[real_name]
+    save_data(data)
+    console.print(f"[bold green]✔ Serveur '{real_name}' supprimé avec succès.[/bold green]")
+
+
+# =============================================================================
+# COMMANDE : EDIT
+# =============================================================================
+
+def cmd_edit(args: argparse.Namespace) -> None:
+    data = load_data()
+    servers = data.get("servers", {})
+
+    server = resolve_server(servers, args.name)
+    if not server:
+        console.print(f"[bold red]Serveur '{args.name}' introuvable.[/bold red]")
+        sys.exit(1)
+
+    fake_args = argparse.Namespace(
+        name=server["name"],
+        target=None,
+        user=server.get("user"),
+        host=server.get("host"),
+        port=server.get("port"),
+        key=server.get("identity_file"),
+        tags=",".join(server.get("tags", [])),
+        desc=server.get("description"),
+        force=True,
+        interactive=True
+    )
+    cmd_set(fake_args)
+
+
+# =============================================================================
+# COMMANDE : COPY-ID
+# =============================================================================
+
+def cmd_copy_id(args: argparse.Namespace) -> None:
+    data = load_data()
+    servers = data.get("servers", {})
+
+    server = resolve_server(servers, args.name)
+    if not server:
+        console.print(f"[bold red]Serveur '{args.name}' introuvable.[/bold red]")
+        sys.exit(1)
+
+    key = args.key or server.get("identity_file")
+    cmd = ["ssh-copy-id"]
+    if server.get("port") and int(server["port"]) != 22:
+        cmd.extend(["-p", str(server["port"])])
+    if key:
+        pub_key = key if key.endswith(".pub") else f"{key}.pub"
+        if Path(pub_key).exists():
+            cmd.extend(["-i", pub_key])
+        else:
+            cmd.extend(["-i", key])
+    target = f"{server['user']}@{server['host']}" if server.get("user") else server["host"]
+    cmd.append(target)
+
+    console.print(f"[cyan]Exécution de ssh-copy-id vers {target}...[/cyan]")
+    res = subprocess.run(cmd)
+    sys.exit(res.returncode)
+
+
+# =============================================================================
+# COMMANDE : SYNC
+# =============================================================================
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    data = load_data()
+    sync_openssh(data.get("servers", {}))
+    console.print(f"[bold green]✔ Synchronisation OpenSSH terminée avec succès ![/bold green]")
+    console.print(f"  [dim]• Fichier généré :[/dim] {SSHM_CONFIG}")
+    console.print(f"  [dim]• Fichier principal :[/dim] {OPENSSH_CONFIG}")
+
+
+# =============================================================================
+# COMPLÉTION & OUTILS INTERNES
+# =============================================================================
+
+def cmd_internal_is_server(name: str) -> None:
+    """Retourne code 0 si le nom est un serveur existant."""
+    data = load_data()
+    servers = data.get("servers", {})
+    if name in servers or any(k.lower() == name.lower() for k in servers):
+        sys.exit(0)
+    sys.exit(1)
+
+
+def cmd_internal_complete() -> None:
+    """Affiche la liste des serveurs pour l'autocomplétion."""
+    data = load_data()
+    servers = data.get("servers", {})
+    for name in sorted(servers.keys()):
+        print(name)
+
+
+# =============================================================================
+# MAIN ENTRYPOINT
+# =============================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="sshm",
+        description="SSH Manager - Modern and fast SSH connection manager."
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Commandes disponibles")
+
+    # SET / ADD
+    p_set = subparsers.add_parser("set", aliases=["add", "save"], help="Ajouter ou modifier un serveur")
+    p_set.add_argument("name", nargs="?", help="Nom / Alias du serveur")
+    p_set.add_argument("target", nargs="?", help="Cible sous forme [user@]host[:port]")
+    p_set.add_argument("-u", "--user", help="Nom d'utilisateur SSH")
+    p_set.add_argument("-H", "--host", help="Hôte (IP ou domaine)")
+    p_set.add_argument("-p", "--port", type=int, help="Port SSH (défaut: 22)")
+    p_set.add_argument("-i", "--key", help="Chemin vers la clé privée")
+    p_set.add_argument("-t", "--tags", help="Tags séparés par virgules")
+    p_set.add_argument("-d", "--desc", help="Description")
+    p_set.add_argument("-f", "--force", action="store_true", help="Écraser sans demander confirmation")
+    p_set.add_argument("--interactive", action="store_true", help="Forcer le mode interactif pas à pas")
+
+    # LIST / LS
+    p_list = subparsers.add_parser("list", aliases=["ls", "l"], help="Lister tous les serveurs")
+    p_list.add_argument("--no-ping", action="store_true", help="Ne pas tester la latence réseau")
+    p_list.add_argument("-t", "--tag", help="Filtrer par tag")
+    p_list.add_argument("-q", "--quiet", action="store_true", help="Afficher uniquement les noms")
+    p_list.add_argument("--json", dest="json_output", action="store_true", help="Format JSON")
+
+    # CONNECT / C
+    p_conn = subparsers.add_parser("connect", aliases=["c", "conn"], help="Se connecter à un serveur")
+    p_conn.add_argument("target", nargs="?", help="Nom ou numéro du serveur (menu interactif si omis)")
+    p_conn.add_argument("extra_args", nargs="*", help="Arguments supplémentaires passés à SSH")
+
+    # TEST / PING
+    p_test = subparsers.add_parser("test", aliases=["ping"], help="Tester la connectivité d'un serveur")
+    p_test.add_argument("target", nargs="?", help="Nom du serveur à tester (tous si omis)")
+
+    # RM / DELETE
+    p_rm = subparsers.add_parser("rm", aliases=["delete", "del"], help="Supprimer un serveur")
+    p_rm.add_argument("name", help="Nom du serveur à supprimer")
+    p_rm.add_argument("-f", "--force", action="store_true", help="Supprimer sans confirmation")
+
+    # EDIT
+    p_edit = subparsers.add_parser("edit", help="Modifier les paramètres d'un serveur")
+    p_edit.add_argument("name", help="Nom du serveur à modifier")
+
+    # COPY-ID
+    p_copy = subparsers.add_parser("copy-id", help="Copier votre clé publique sur le serveur")
+    p_copy.add_argument("name", help="Nom du serveur")
+    p_copy.add_argument("-i", "--key", help="Clé spécifique à copier")
+
+    # SYNC
+    subparsers.add_parser("sync", help="Synchroniser la configuration OpenSSH (~/.ssh/sshm_config)")
+
+    # Commandes internes pour wrapper shell
+    p_is = subparsers.add_parser("_is_server")
+    p_is.add_argument("name")
+    subparsers.add_parser("_complete_names")
+
+    if len(sys.argv) == 1:
+        data = load_data()
+        if data.get("servers"):
+            cmd_connect(argparse.Namespace(target=None, extra_args=[]))
+            return
+        else:
+            parser.print_help()
+            return
+
+    args, unknown = parser.parse_known_args()
+
+    if args.command in ("connect", "c", "conn") and unknown:
+        args.extra_args = (args.extra_args or []) + unknown
+
+    if args.command in ("set", "add", "save"):
+        cmd_set(args)
+    elif args.command in ("list", "ls", "l"):
+        cmd_list(args)
+    elif args.command in ("connect", "c", "conn"):
+        cmd_connect(args)
+    elif args.command in ("test", "ping"):
+        cmd_test(args)
+    elif args.command in ("rm", "delete", "del"):
+        cmd_rm(args)
+    elif args.command == "edit":
+        cmd_edit(args)
+    elif args.command == "copy-id":
+        cmd_copy_id(args)
+    elif args.command == "sync":
+        cmd_sync(args)
+    elif args.command == "_is_server":
+        cmd_internal_is_server(args.name)
+    elif args.command == "_complete_names":
+        cmd_internal_complete()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrompu.")
+        sys.exit(130)

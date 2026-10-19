@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssh-manager-cli"
+version = "1.0.0"
+authors = [
+  { name="Novanns PONS", email="ponsnovanns@gmail.com" },
+]
+description = "A modern, fast, and elegant SSH connection manager with TUI picker and OpenSSH sync"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Environment :: Console :: Curses",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "rich>=13.0.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/npons971/SSH_Manager"
+"Bug Tracker" = "https://github.com/npons971/SSH_Manager/issues"
+
+[project.scripts]
+sshm = "bin.sshm:main"
